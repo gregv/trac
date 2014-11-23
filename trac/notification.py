@@ -22,13 +22,11 @@ import time
 from genshi.builder import tag
 
 from trac import __version__
-from trac.config import BoolOption, ConfigurationError, ExtensionOption, \
-                        IntOption, Option
+from trac.config import BoolOption, ExtensionOption, IntOption, Option
 from trac.core import *
 from trac.util.compat import close_fds
-from trac.util.html import to_fragment
-from trac.util.text import CRLF, fix_eol, to_unicode
-from trac.util.translation import _, deactivate, reactivate, tag_
+from trac.util.text import CRLF, fix_eol
+from trac.util.translation import _, deactivate, reactivate
 
 MAXHEADERLEN = 76
 EMAIL_LOOKALIKE_PATTERN = (
@@ -46,9 +44,14 @@ class IEmailSender(Interface):
     def send(self, from_addr, recipients, message):
         """Send message to recipients."""
 
+class ISlackSender(Interface):
+    """Extension point interface for components that allow sending slack message."""
+
+    def send(self, from_addr, message):
+        """Send message to slack."""
 
 class NotificationSystem(Component):
-
+    slack_sender = ExtensionOption('notification','slack_sender',ISlackSender,'SlackSender', """Blah""")
     email_sender = ExtensionOption('notification', 'email_sender',
                                    IEmailSender, 'SmtpEmailSender',
         """Name of the component implementing `IEmailSender`.
@@ -126,6 +129,60 @@ class NotificationSystem(Component):
         """Send message to recipients via e-mail."""
         self.email_sender.send(from_addr, recipients, message)
 
+    def send_slack(self, from_addr, message):
+        """Send message to recipients via e-mail."""
+        self.slack_sender.send(from_addr, message)
+
+class SlackSender(Component):    
+    """Slack sender"""
+    
+
+    implements(ISlackSender)
+
+    def send(self, from_addr, message):
+        SLACK_URL="https://hooks.slack.com/services/<YOUR URL>"
+        SLACK_CHANNEL="#trac-updates"
+        SLACK_USERNAME="trac"
+        SLACK_EMOJI=":rocket:"
+        self.log.info("Sending crap to Slack")
+        import myrequests       
+        import json
+        import email
+
+        content = email.message_from_string(message)
+        payload = content.get_payload()
+        try:
+            payload = base64.decodestring(payload)
+        except:
+            pass
+
+        newcont = []
+        omitheader = 2
+        
+        for line in payload.split("\n"):
+            self.log.info("line %r" % line)
+            #filter out header + lines (free to extend)
+            if omitheader == 2 and "-----+-----" in line: 
+               omitheader -= 1
+               continue
+            if omitheader == 1:
+               if "-----+-----" in line:
+                   omitheader -= 1
+               continue
+            if line in ("-- ", ""):
+               continue
+            newcont.append(line)
+
+        self.log.info("newcont: %r" % newcont)
+
+        data = {"channel": SLACK_CHANNEL,
+            "username": SLACK_USERNAME,
+            "text": "%s"% ("\n".join(newcont)),
+            "icon_emoji": SLACK_EMOJI
+            }         
+
+        r = myrequests.post(SLACK_URL, data={"payload":json.dumps(data)})
+        self.log.info("r.status %r r.text %r " % (r.status_code, r))
 
 class SmtpEmailSender(Component):
     """E-mail sender connecting to an SMTP server."""
@@ -151,23 +208,14 @@ class SmtpEmailSender(Component):
         # Ensure the message complies with RFC2822: use CRLF line endings
         message = fix_eol(message, CRLF)
 
-        self.log.info("Sending notification through SMTP at %s:%d to %s",
-                      self.smtp_server, self.smtp_port, recipients)
-        try:
-            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
-        except smtplib.socket.error, e:
-            raise ConfigurationError(
-                tag_("SMTP server connection error (%(error)s). Please "
-                     "modify %(option1)s or %(option2)s in your "
-                     "configuration.",
-                     error=to_unicode(e),
-                     option1=tag.tt("[notification] smtp_server"),
-                     option2=tag.tt("[notification] smtp_port")))
+        self.log.info("Sending notification through SMTP at %s:%d to %s"
+                      % (self.smtp_server, self.smtp_port, recipients))
+        server = smtplib.SMTP(self.smtp_server, self.smtp_port)
         # server.set_debuglevel(True)
         if self.use_tls:
             server.ehlo()
-            if 'starttls' not in server.esmtp_features:
-                raise TracError(_("TLS enabled but server does not support "
+            if not server.esmtp_features.has_key('starttls'):
+                raise TracError(_("TLS enabled but server does not support " \
                                   "TLS"))
             server.starttls()
             server.ehlo()
@@ -179,7 +227,7 @@ class SmtpEmailSender(Component):
         t = time.time() - start
         if t > 5:
             self.log.warning('Slow mail submission (%.2f s), '
-                             'check your mail setup', t)
+                             'check your mail setup' % t)
         if self.use_tls:
             # avoid false failure detection when the server closes
             # the SMTP connection with TLS enabled
@@ -207,20 +255,13 @@ class SendmailEmailSender(Component):
         # Use native line endings in message
         message = fix_eol(message, os.linesep)
 
-        self.log.info("Sending notification through sendmail at %s to %s",
-                      self.sendmail_path, recipients)
+        self.log.info("Sending notification through sendmail at %s to %s"
+                      % (self.sendmail_path, recipients))
         cmdline = [self.sendmail_path, "-i", "-f", from_addr]
         cmdline.extend(recipients)
-        self.log.debug("Sendmail command line: %s", cmdline)
-        try:
-            child = Popen(cmdline, bufsize=-1, stdin=PIPE, stdout=PIPE,
-                          stderr=PIPE, close_fds=close_fds)
-        except OSError, e:
-            raise ConfigurationError(
-                tag_("Sendmail error (%(error)s). Please modify %(option)s "
-                     "in your configuration.",
-                     error=to_unicode(e),
-                     option=tag.tt("[notification] sendmail_path")))
+        self.log.debug("Sendmail command line: %s" % cmdline)
+        child = Popen(cmdline, bufsize=-1, stdin=PIPE, stdout=PIPE,
+                      stderr=PIPE, close_fds=close_fds)
         out, err = child.communicate(message)
         if child.returncode or err:
             raise Exception("Sendmail failed with (%s, %s), command: '%s'"
@@ -245,7 +286,7 @@ class Notify(object):
         self.data = Chrome(self.env).populate_data(None, {'CRLF': CRLF})
 
     def notify(self, resid):
-        torcpts, ccrcpts = self.get_recipients(resid)
+        (torcpts, ccrcpts) = self.get_recipients(resid)
         self.begin_send()
         self.send(torcpts, ccrcpts)
         self.finish_send()
@@ -351,20 +392,15 @@ class NotifyEmail(Notify):
         self.from_email = from_email or self.replyto_email
         self.from_name = from_name
         if not self.from_email and not self.replyto_email:
-            message = tag(
-                tag.p(_('Unable to send email due to identity crisis.')),
-                # convert explicitly to `Fragment` to avoid breaking message
-                # when passing `LazyProxy` object to `Fragment`
-                tag.p(to_fragment(tag_(
-                    "Neither %(from_)s nor %(reply_to)s are specified in the "
-                    "configuration.",
-                    from_=tag.strong('[notification] smtp_from'),
-                    reply_to=tag.strong('[notification] smtp_replyto')))))
-            raise TracError(message, _('SMTP Notification Error'))
+            raise TracError(tag(
+                    tag.p(_('Unable to send email due to identity crisis.')),
+                    tag.p(_('Neither %(from_)s nor %(reply_to)s are specified '
+                            'in the configuration.',
+                            from_=tag.b('notification.from'),
+                            reply_to=tag.b('notification.reply_to')))),
+                _('SMTP Notification Error'))
 
         Notify.notify(self, resid)
-
-    _mime_encoding_re = re.compile(r'=\?[^?]+\?[bq]\?[^?]+\?=', re.IGNORECASE)
 
     def format_header(self, key, name, email=None):
         from email.Header import Header
@@ -372,23 +408,14 @@ class NotifyEmail(Notify):
         # Do not sent ridiculous short headers
         if maxlength < 10:
             raise TracError(_("Header length is too short"))
-        # when it matches mime-encoding, encode as mime even if only
-        # ascii characters
-        header = None
-        if not self._mime_encoding_re.search(name):
-            try:
-                tmp = name.encode('ascii')
-                header = Header(tmp, 'ascii', maxlinelen=maxlength)
-            except UnicodeEncodeError:
-                pass
-        if not header:
-            header = Header(name.encode(self._charset.output_codec),
-                            self._charset, maxlinelen=maxlength)
+        try:
+            tmp = name.encode('ascii')
+            header = Header(tmp, 'ascii', maxlinelen=maxlength)
+        except UnicodeEncodeError:
+            header = Header(name, self._charset, maxlinelen=maxlength)
         if not email:
             return header
         else:
-            header = str(header).replace('\\', r'\\') \
-                                .replace('"', r'\"')
             return '"%s" <%s>' % (header, email)
 
     def add_headers(self, msg, headers):
@@ -418,7 +445,7 @@ class NotifyEmail(Notify):
             if domain:
                 address = "%s@%s" % (address, domain)
             else:
-                self.env.log.info("Email address w/o domain: %s", address)
+                self.env.log.info("Email address w/o domain: %s" % address)
                 return None
 
         mo = self.shortaddr_re.search(address)
@@ -427,7 +454,7 @@ class NotifyEmail(Notify):
         mo = self.longaddr_re.search(address)
         if mo:
             return mo.group(2)
-        self.env.log.info("Invalid email address: %s", address)
+        self.env.log.info("Invalid email address: %s" % address)
         return None
 
     def encode_header(self, key, value):
@@ -492,7 +519,7 @@ class NotifyEmail(Notify):
 
         # if there is not valid recipient, leave immediately
         if len(recipients) < 1:
-            self.env.log.info("no recipient for a ticket notification")
+            self.env.log.info('no recipient for a ticket notification')
             return
 
         pcc = accaddrs
@@ -512,4 +539,6 @@ class NotifyEmail(Notify):
         self.add_headers(msg, headers)
         self.add_headers(msg, mime_headers)
         NotificationSystem(self.env).send_email(self.from_email, recipients,
+                                                msg.as_string())
+        NotificationSystem(self.env).send_slack(self.from_email,
                                                 msg.as_string())
